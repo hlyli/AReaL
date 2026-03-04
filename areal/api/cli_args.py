@@ -1268,6 +1268,10 @@ class PPOCriticConfig(TrainEngineConfig):
 def get_py_cmd(module: str, args: dict[str, Any]):
     # convert to flags
     cmd = ["python3", "-m", module]
+    return process_args(cmd, args)
+
+
+def process_args(cmd, args):
     for k, v in args.items():
         if v is None or v is False or v == "" or (isinstance(v, list) and not v):
             continue
@@ -1331,6 +1335,11 @@ class vLLMConfig:
     max_lora_rank: int = 16  # vllm's default
     max_loras: int = 8  # override default
     lora_modules: list[str] | None = None  # lora_modules is automatically filled
+    data_parallel_size: int = 1
+    # will use explicit vllm config tp and pp if specified otherwise use allocmode
+    tensor_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
+    enable_expert_parallel: bool = False
 
     @staticmethod
     def build_args(
@@ -1347,10 +1356,15 @@ class vLLMConfig:
             tokenizer=vllm_config.model,
             load_format="auto",
             trust_remote_code=True,
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
             **args,
         )
+
+        # only add the given distributed sizes if not specified in config
+        if args["tensor_parallel_size"] is None:
+            args["tensor_parallel_size"] = tp_size
+        if args["pipeline_parallel_size"] is None:
+            args["pipeline_parallel_size"] = pp_size
+
         if port is not None:
             args["port"] = port
         if host is not None:
@@ -1360,6 +1374,15 @@ class vLLMConfig:
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
         return get_py_cmd("areal.engine.vllm_ext.areal_vllm_server", args)
+
+    @staticmethod
+    def build_cmd_from_args_headless(args: dict[str, Any]):
+        args = args.copy()
+        model = args.pop("model")
+        args["headless"] = True
+        # vllm serve needed for headless mode
+        # need to add model directly following vllm serve
+        return process_args(["vllm", "serve", model], args)
 
     @staticmethod
     def build_cmd(

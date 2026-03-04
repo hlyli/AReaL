@@ -33,7 +33,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
-from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine import RemoteSGLangEngine, RemotevLLMEngine, RayRemotevLLMEngine
 from areal.infra import (
     LocalScheduler,
     RayScheduler,
@@ -744,7 +744,14 @@ class PPOTrainer:
                 self.config.vllm.lora_modules = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
                 ]
-            engine_cls = RemotevLLMEngine
+            if (
+                self.allocation_mode.gen_instance_size
+                > self.config.cluster.n_gpus_per_node
+            ):
+                # gen instance spans more than 1 node
+                engine_cls = RayRemotevLLMEngine
+            else:
+                engine_cls = RemotevLLMEngine
             server_args = vLLMConfig.build_args(
                 vllm_config=self.config.vllm,
                 tp_size=self.allocation_mode.gen.tp_size,
