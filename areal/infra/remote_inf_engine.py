@@ -927,7 +927,7 @@ class RemoteInfEngine(InferenceEngine):
                 )
                 return
             self.logger.info(
-                f"Initialized {current_platform.communication_backend.upper()} group "
+                f"Initialized {meta.backend} group "
                 f"for distributed weight update for {meta.nccl_group_name}."
             )
 
@@ -1257,15 +1257,15 @@ class RemoteInfEngine(InferenceEngine):
         """Launch a local inference server."""
         server_args["host"] = gethostip()
         server_args["port"] = find_free_ports(1)[0]
-        process = self.backend.launch_server(server_args)
+        launch_reference = self.backend.launch_server(server_args)
         address = format_hostport(server_args["host"], server_args["port"])
-        server_info = LocalInfServerInfo(
+        server_info = LocalInfServerInfo.from_launch_result(
             host=server_args["host"],
             port=server_args["port"],
-            process=process,
+            ret=launch_reference,
         )
         try:
-            self._wait_for_server(address, process=process)
+            self._wait_for_server(address, process=launch_reference)
             self.local_server_processes.append(server_info)
             if ray.is_initialized():
                 # do not return with process for ray as it is not picklable
@@ -1286,9 +1286,15 @@ class RemoteInfEngine(InferenceEngine):
         addr = format_hostport(server_info.host, server_info.port)
         if addr in self.addresses:
             self.addresses.remove(addr)
-        if server_info.process.poll() is not None:
-            return
-        kill_process_tree(server_info.process.pid, graceful=True)
+        if server_info.is_popen:
+            if server_info.process.poll() is not None:
+                return
+            kill_process_tree(server_info.process.pid, graceful=True)
+        elif server_info.is_ray:
+            for actor in server_info.actors:
+                logger.info(f"Shutting down actor {actor}")
+                # manual graceful termination
+                actor.destroy().remote()
 
     def teardown_server(self):
         """Teardown all locally launched servers."""

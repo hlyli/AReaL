@@ -1,3 +1,4 @@
+import abc
 import os
 import subprocess
 import sys
@@ -6,6 +7,9 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import ray
+from ray.runtime_env import RuntimeEnv
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
@@ -28,14 +32,200 @@ from areal.api.io_struct import (
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
+from areal.infra.utils.proc import kill_process_tree
+from areal.infra.utils.ray import (
+    create_resource_spec,
+    get_placement_group_master_ip_and_port,
+)
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
 
 logger = logging.getLogger("vLLMEngine")
 
 
+def _copy_environ():
+    _env = os.environ.copy()
+    triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
+    _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+
+    vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
+    if vllm_cache_path:
+        _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
+    _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+    return _env
+
+
+class VLLMLauncher(abc.ABC):
+    """
+    Base class for launching VLLM instances through VLLMBackend
+    """
+
+    @abc.abstractmethod
+    def launch_server(self, args: dict) -> Any: ...
+
+
+class LocalVLLMLauncher(VLLMLauncher):
+    """
+    Classic launcher that launches a single node instance through POpen
+    """
+
+    def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
+        """Launch vLLM server subprocess."""
+        cmd = vLLMConfig.build_cmd_from_args(server_args)
+        _env = _copy_environ()
+
+        logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
+        return subprocess.Popen(
+            cmd,
+            env=_env,
+            stdout=sys.stdout,
+            stderr=sys.stdout,
+        )
+
+
+@ray.remote
+class RayVLLMNode:
+    """
+    Per node actor that launches POpen, in multinode, there are multiple of these actors that comprise 1 instance
+    """
+
+    def __init__(self):
+        self.process = None
+
+    def launch_server(self, server_args: dict[str, Any], headless):
+        if headless:
+            cmd = vLLMConfig.build_cmd_from_args_headless(server_args)
+        else:
+            cmd = vLLMConfig.build_cmd_from_args(server_args)
+
+        _env = _copy_environ()
+
+        logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
+        self.process = subprocess.Popen(
+            cmd, env=_env, stdout=sys.stdout, stderr=sys.stdout
+        )
+
+    def destroy(self):
+        logger.info("Received termination, killing vllm server process")
+        if self.process and self.process.poll() is None:
+            kill_process_tree(self.process.pid, graceful=True)
+
+    def __ray_shutdown__(self):
+        self.destroy()
+
+
+class RayVLLMLauncher(VLLMLauncher):
+    """
+    Launches multiple RayVLLMNode actors that each perform POpen.
+    This class does management of Ray resources and scheduling of VLLM instances that span multinode
+    """
+
+    def __init__(self):
+        # save actors as strings instead of ref as actor ref is not serializable in ProcessPoolExecutor
+        self.actor_names: list[str] = []
+        # for dp
+        self.dp_ip = ""
+        self.dp_port = 0
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    @staticmethod
+    def _get_gpu(bundle):
+        if "NPU" in bundle:
+            return "NPU"
+        elif "GPU" in bundle:
+            return "GPU"
+
+        return ""
+
+    @staticmethod
+    def _get_resource_spec_and_n_gpu(bundle):
+        cpu = bundle["CPU"]
+        # already in bytes since it's from the bundle
+        memory = bundle["memory"]
+
+        # cannot be autodetected since this launcher is launched with 0 gpus
+        # must read from bundle
+        n_gpu = 0
+        device = "CPU"
+        if device := RayVLLMLauncher._get_gpu(bundle):
+            n_gpu = bundle[device]
+
+        return create_resource_spec(device, cpu, n_gpu, memory), n_gpu
+
+    def launch_server(
+        self, server_args: dict[str, Any]
+    ) -> list[ray.actor.ActorHandle[RayVLLMNode]]:
+        pg = ray.util.get_current_placement_group()
+        tp_size = server_args["tensor_parallel_size"]
+        pp_size = server_args["pipeline_parallel_size"]
+        dp_group_world_size = tp_size * pp_size
+        dp_offset = 0
+        is_head = True
+
+        actors = []
+
+        for i, bundle in enumerate(pg.bundle_specs):
+            options, n_gpu = RayVLLMLauncher._get_resource_spec_and_n_gpu(bundle)
+            current_args = server_args.copy()
+            if is_head:
+                self.dp_ip, self.dp_port = get_placement_group_master_ip_and_port(pg, i)
+            logger.info(f"Launching actor {i}")
+
+            # remove VISIBLE DEVICE envs as ray head had already set them
+            # without removing them, vLLM cannot access devices
+            # similarly with ray inherited env vars as they can cause scheduling issues
+            _env = _copy_environ()
+            new_env = {}
+            for k, v in _env.items():
+                if "VISIBLE_DEVICE" in k:
+                    continue
+                if "VISIBLE_CORE" in k:
+                    continue
+                if "RAY_" in k:
+                    continue
+                new_env[k] = v
+
+            actor_name = str(uuid.uuid4())
+            actor = RayVLLMNode.options(
+                **options,
+                name=actor_name,
+                lifetime="detached",
+                runtime_env=RuntimeEnv(env_vars=new_env),
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=i,
+                ),
+            ).remote()
+
+            # cast to int as the args require integer values
+            n_gpu = int(n_gpu)
+            dp_local = n_gpu // dp_group_world_size
+            current_args["data_parallel_size_local"] = dp_local
+            current_args["data_parallel_address"] = self.dp_ip
+            current_args["data_parallel_rpc_port"] = self.dp_port
+            self.logger.info(f"Launching server for VLLM head {self.dp_ip}")
+            if is_head:
+                current_args["api_server_count"] = int(bundle["CPU"])
+                actor.launch_server.remote(current_args, False)
+                is_head = False
+            else:
+                current_args["data_parallel_start_rank"] = dp_offset
+                actor.launch_server.remote(current_args, True)
+
+            dp_offset += dp_local
+
+            self.actor_names.append(actor_name)
+            actors.append(actor)
+
+        return actors
+
+
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
+
+    def __init__(self, launcher_cls: type[VLLMLauncher] = LocalVLLMLauncher):
+        self.launcher = launcher_cls()
 
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
@@ -203,7 +393,9 @@ class VLLMBackend:
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
             "world_size": gen_parallel.world_size + 1,
-            "backend": current_platform.communication_backend,
+            "backend": meta.backend
+            if meta.backend is not None
+            else current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }
         return HttpRequest(endpoint="/areal_init_weights_update_group", payload=payload)
@@ -248,25 +440,7 @@ class VLLMBackend:
         return HttpRequest(endpoint=endpoint, payload={}, method="POST")
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
-        """Launch vLLM server subprocess."""
-        cmd = vLLMConfig.build_cmd_from_args(server_args)
-
-        _env = os.environ.copy()
-        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
-        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
-
-        vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
-        if vllm_cache_path:
-            _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
-        _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
-
-        logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
-        return subprocess.Popen(
-            cmd,
-            env=_env,
-            stdout=sys.stdout,
-            stderr=sys.stdout,
-        )
+        return self.launcher.launch_server(server_args)
 
 
 class RemotevLLMEngine(InferenceEngine):
@@ -285,7 +459,13 @@ class RemotevLLMEngine(InferenceEngine):
     def __init__(self, config: InferenceEngineConfig):
         self.config = config
         # Pure composition - create internal engine with vLLM backend
-        self._engine = RemoteInfEngine(config, VLLMBackend())
+        if ray.is_initialized() and any(
+            spec.ray_placement_strategy == "deferred" for spec in config.scheduling_spec
+        ):
+            vllm_launcher_cls = RayVLLMLauncher
+        else:
+            vllm_launcher_cls = LocalVLLMLauncher
+        self._engine = RemoteInfEngine(config, VLLMBackend(vllm_launcher_cls))
 
     def initialize(
         self,

@@ -186,3 +186,7 @@ class RayRPCServer:
         self._engines.clear()
         self._default_engine_name = None
         ray.actor.exit_actor()
+
+
+def __ray_shutdown__(self):
+    self.destroy()
