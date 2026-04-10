@@ -34,7 +34,6 @@ from areal.infra.utils.ray_placement_group import (
     RayPlacementStrategy,
     SeparatedRayPlacementStrategy,
     SharedRayPlacementStrategy,
-    ray_resource_type,
 )
 from areal.utils import logging
 from areal.utils.offload import get_tms_env_vars
@@ -263,26 +262,29 @@ class RayScheduler(Scheduler):
 
             # Use 0.01 GPU to share with target worker (which uses 0.9)
             # This allows multiple forked workers per target if needed
-            device = ray_resource_type()
             additional_options = {}
             if spec.gpu > 0:
-                if spec.gpu > 1:
-                    raise NotImplementedError(
-                        "Colocation of multi-GPU workers together is not supported by Ray"
-                    )
-                if device == "GPU":
-                    additional_options = dict(num_gpus=0.01)
-                else:
-                    additional_options = {"resources": {device: 0.01}}
+                raise RuntimeError(
+                    "Forked workers should use 0 GPU for ray scheduling and instead copy the environment variable from parent to avoid scheduling issues."
+                )
             if command and "rpc.rpc_server" not in command:
                 actor_cls = RayHTTPLauncher
             else:
                 actor_cls = RayRPCServer
+
+            forked_env_vars = target_wi.env_vars.copy()
+
+            device_env_name, device_list = ray.get(
+                target_wi.actor.get_device_env_var.remote()
+            )
+            if device_env_name:
+                forked_env_vars[device_env_name] = device_list
+
             actor = actor_cls.options(
                 **additional_options,
                 num_cpus=0,  # Minimal CPU allocation for forked actor
                 name=worker_id,
-                runtime_env=RuntimeEnv(env_vars=target_wi.env_vars),
+                runtime_env=RuntimeEnv(env_vars=forked_env_vars),
                 scheduling_strategy=PlacementGroupSchedulingStrategy(**strategy_kwargs),
             ).remote(
                 config=self.exp_config,
@@ -315,7 +317,7 @@ class RayScheduler(Scheduler):
                 placement_group=pg,  # Same PG as target
                 bundle_index=bundle_idx,
                 created_at=time.time(),
-                env_vars=target_wi.env_vars.copy(),
+                env_vars=forked_env_vars,
             )
             worker_info_list.append(wi)
             worker_ids.append(worker_id)

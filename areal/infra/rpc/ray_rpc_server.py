@@ -85,6 +85,15 @@ class RayServer(abc.ABC):
         for k, v in env.items():
             os.environ[str(k)] = str(v)
 
+    def get_env(self, name: str) -> str:
+        return os.environ.get(name, "")
+
+    def get_device_env_var(self) -> tuple[str, str]:
+        from areal.infra.platforms import current_platform
+
+        device_env_var = current_platform.device_control_env_var
+        return (device_env_var, self.get_env(device_env_var))
+
     def post_init(self, **kwargs) -> Any:
         # the HTTPLauncher needs this, but keeping this here for interface compatibility
         # launched after the actor has been deployed
