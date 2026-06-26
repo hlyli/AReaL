@@ -121,8 +121,10 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
+    reassemble_cp_bshd_tensor,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
+    split_packed_to_bshd_for_context_parallel,
 )
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
@@ -548,8 +550,9 @@ class MegatronEngine(TrainEngine):
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
-                    raise NotImplementedError(
-                        "Context parallel (CP > 1) is not supported with VLM models. "
+                    self.logger.warning(
+                        "Context parallel (CP > 1) is not fully supported with VLM models. "
+                        "Image inputs may fail in forward. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
                         f"for model_type={self.hf_config.model_type}."
                     )
@@ -559,15 +562,6 @@ class MegatronEngine(TrainEngine):
                 self.logger.info(
                     f"VLM model detected (type={self.hf_config.model_type}). "
                     f"Loaded processor and tokenizer."
-                )
-
-            if self.use_padded_seq and self.parallel_strategy.context_parallel_size > 1:
-                raise NotImplementedError(
-                    f"Context parallel (CP > 1) is not supported for "
-                    f"model_type={self.hf_config.model_type!r}, which requires the "
-                    "padded BSHD forward (it operates on [B, S] tensors while the "
-                    "CP path packs sequences). "
-                    f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
                 )
 
             self.quantization_config = getattr(
@@ -1053,6 +1047,22 @@ class MegatronEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
+        self._forward_backward_batch(
+            mb_list,
+            process_output_fn,
+            forward_only=forward_only,
+            gather_cp_output=False,
+        )
+
+    def _forward_backward_batch(
+        self,
+        mb_list: MicroBatchList,
+        process_output_fn: Callable[
+            [torch.Tensor, dict[str, Any]], torch.Tensor | None
+        ],
+        forward_only: bool = False,
+        gather_cp_output: bool = False,
+    ) -> None:
         self._ensure_ready()
 
         def forward_step(batch_iter, model):
@@ -1083,12 +1093,12 @@ class MegatronEngine(TrainEngine):
                     tree_attn_keys = list(tree_kwargs.keys())
 
             cp_size = mpu.get_context_parallel_world_size()
-            cp_local = cp_size > 1
+            cp_local = cp_size > 1 and not gather_cp_output
 
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
-                gather_cp_output=not cp_local,
+                gather_cp_output=gather_cp_output,
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
             )
@@ -1117,14 +1127,25 @@ class MegatronEngine(TrainEngine):
                     rolled_ids = torch.roll(
                         mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
                     )
-                    cp_labels = split_packed_seqs_for_context_parallel(
-                        rolled_ids, padded_cu_seqlens
-                    )
+                    if self.use_padded_seq:
+                        cp_labels = split_packed_to_bshd_for_context_parallel(
+                            rolled_ids,
+                            padded_cu_seqlens,
+                        )
+                    else:
+                        cp_labels = split_packed_seqs_for_context_parallel(
+                            rolled_ids, padded_cu_seqlens
+                        )
                     cp_inputs = dict(mb_input.orig_mb)
                     cp_inputs["_cp_local_labels"] = cp_labels
                     cp_inputs["_cp_padded_cu_seqlens"] = padded_cu_seqlens
                     cp_inputs["_cp_padding_length"] = mb_input.padding_length
                     cp_inputs["_cp_old_cu_seqlens"] = mb_input.old_cu_seqlens
+                    if self.use_padded_seq:
+                        cp_seq_lens = padded_cu_seqlens[1:] - padded_cu_seqlens[:-1]
+                        cp_inputs["_cp_layout"] = "bshd"
+                        cp_inputs["_cp_seq_lens"] = cp_seq_lens
+                        cp_inputs["_cp_max_seqlen"] = int(cp_seq_lens.max().item())
                     return output, functools.partial(_process_output, cp_inputs)
                 else:
                     output = unpad_logits(
@@ -1293,7 +1314,12 @@ class MegatronEngine(TrainEngine):
             outputs.append(result)
             return None
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=True)
+        self._forward_backward_batch(
+            mb_list,
+            process_output,
+            forward_only=True,
+            gather_cp_output=True,
+        )
 
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
@@ -2604,18 +2630,34 @@ class MegatronEngine(TrainEngine):
                 vocab_min_logits = output.detach().min(-1).values.float()
                 vocab_max_logits = output.detach().max(-1).values.float()
                 if cp_padded_cu_seqlens is not None:
-                    logprobs = reassemble_cp_packed_logprobs(
-                        logprobs, cp_padded_cu_seqlens
-                    )
-                    entropy = reassemble_cp_packed_logprobs(
-                        entropy, cp_padded_cu_seqlens
-                    )
-                    vocab_min_logits = reassemble_cp_packed_logprobs(
-                        vocab_min_logits, cp_padded_cu_seqlens
-                    )
-                    vocab_max_logits = reassemble_cp_packed_logprobs(
-                        vocab_max_logits, cp_padded_cu_seqlens
-                    )
+                    if inputs.get("_cp_layout") == "bshd":
+                        cp_seq_lens = inputs["_cp_seq_lens"]
+                        cp_max_seqlen = inputs["_cp_max_seqlen"]
+                        logprobs = reassemble_cp_bshd_tensor(
+                            logprobs, cp_seq_lens, cp_max_seqlen
+                        )
+                        entropy = reassemble_cp_bshd_tensor(
+                            entropy, cp_seq_lens, cp_max_seqlen
+                        )
+                        vocab_min_logits = reassemble_cp_bshd_tensor(
+                            vocab_min_logits, cp_seq_lens, cp_max_seqlen
+                        )
+                        vocab_max_logits = reassemble_cp_bshd_tensor(
+                            vocab_max_logits, cp_seq_lens, cp_max_seqlen
+                        )
+                    else:
+                        logprobs = reassemble_cp_packed_logprobs(
+                            logprobs, cp_padded_cu_seqlens
+                        )
+                        entropy = reassemble_cp_packed_logprobs(
+                            entropy, cp_padded_cu_seqlens
+                        )
+                        vocab_min_logits = reassemble_cp_packed_logprobs(
+                            vocab_min_logits, cp_padded_cu_seqlens
+                        )
+                        vocab_max_logits = reassemble_cp_packed_logprobs(
+                            vocab_max_logits, cp_padded_cu_seqlens
+                        )
                     cp_padding_length = inputs.get("_cp_padding_length", 0)
                     cp_old_cu_seqlens = inputs.get("_cp_old_cu_seqlens")
                     logprobs = unpad_logits(

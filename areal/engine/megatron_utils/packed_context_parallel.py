@@ -108,6 +108,125 @@ def split_packed_seqs_for_context_parallel(
     return splitted
 
 
+def split_bshd_for_context_parallel(tensor: torch.Tensor) -> torch.Tensor:
+    """Split a padded BSHD-style tensor along sequence dim for Megatron CP.
+
+    Megatron context parallelism uses the same zigzag load-balancing layout for
+    padded BSHD inputs as the packed THD helper uses per packed sequence: each
+    CP rank receives one chunk from the left side and the mirrored chunk from
+    the right side.
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    if cp_size <= 1:
+        return tensor
+
+    seq_len = tensor.shape[1]
+    if seq_len % (cp_size * 2) != 0:
+        raise ValueError(
+            f"Sequence length ({seq_len}) must be a multiple of "
+            f"2 * context_parallel_size ({2 * cp_size}) for BSHD context "
+            "parallelism in Megatron."
+        )
+
+    local_seq_len = seq_len // cp_size
+    half_local_seq_len = local_seq_len // 2
+    left = tensor[
+        :,
+        half_local_seq_len * cp_rank : half_local_seq_len * (cp_rank + 1),
+        ...,
+    ]
+    right_start = seq_len - half_local_seq_len * (cp_rank + 1)
+    right_end = seq_len - half_local_seq_len * cp_rank
+    right = tensor[:, right_start:right_end, ...]
+    return torch.cat((left, right), dim=1).contiguous()
+
+
+def packed_to_padded_bshd(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    pad_value: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Convert packed 1D token ids into padded [B, S] form plus valid mask."""
+    batch_size = cu_seqlens.shape[0] - 1
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = int(seq_lens.max().item())
+    attention_mask = (
+        torch.arange(max_seqlen, device=input_ids.device)[None, :] < seq_lens[:, None]
+    )
+    input_ids_2d = torch.full(
+        (batch_size, max_seqlen),
+        pad_value,
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    input_ids_2d[attention_mask] = input_ids
+    return input_ids_2d, attention_mask, seq_lens, max_seqlen
+
+
+def split_packed_to_bshd_for_context_parallel(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    pad_value: int = 0,
+) -> torch.Tensor:
+    """Convert packed 1D token ids to padded BSHD and return CP-local flat ids."""
+    input_ids_2d, _, _, _ = packed_to_padded_bshd(
+        input_ids, cu_seqlens, pad_value=pad_value
+    )
+    return split_bshd_for_context_parallel(input_ids_2d).reshape(-1)
+
+
+def reassemble_cp_bshd_tensor(
+    local_tensor: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """All-gather and repack CP-local BSHD tensors into packed valid-token order."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        mask = torch.arange(max_seqlen, device=local_tensor.device)[None, :]
+        mask = mask < seq_lens[:, None]
+        return local_tensor.reshape(
+            seq_lens.shape[0], max_seqlen, *local_tensor.shape[1:]
+        )[mask]
+
+    batch_size = seq_lens.shape[0]
+    local_seq_len = max_seqlen // cp_size
+    if max_seqlen % (cp_size * 2) != 0:
+        raise ValueError(
+            f"Sequence length ({max_seqlen}) must be a multiple of "
+            f"2 * context_parallel_size ({2 * cp_size}) for BSHD context "
+            "parallel reassembly in Megatron."
+        )
+
+    local_view = local_tensor.reshape(
+        batch_size, local_seq_len, *local_tensor.shape[1:]
+    )
+    gathered = dist_F.all_gather(local_view, group=mpu.get_context_parallel_group())
+
+    full = torch.empty(
+        (batch_size, max_seqlen, *local_tensor.shape[1:]),
+        dtype=local_tensor.dtype,
+        device=local_tensor.device,
+    )
+    half_local_seq_len = local_seq_len // 2
+    for rank, chunk in enumerate(gathered):
+        full[
+            :,
+            half_local_seq_len * rank : half_local_seq_len * (rank + 1),
+            ...,
+        ] = chunk[:, :half_local_seq_len, ...]
+        right_start = max_seqlen - half_local_seq_len * (rank + 1)
+        right_end = max_seqlen - half_local_seq_len * rank
+        full[:, right_start:right_end, ...] = chunk[:, half_local_seq_len:, ...]
+
+    mask = torch.arange(max_seqlen, device=local_tensor.device)[None, :]
+    mask = mask < seq_lens[:, None]
+    return full[mask]
+
+
 def _build_cp_reassemble_indices(
     padded_cu_seqlens: torch.Tensor,
     cp_size: int,
@@ -311,6 +430,7 @@ def packed_context_parallel_forward(
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
     padded_repack_info = None
+    bshd_cp_flatten = False
 
     if cu_seqlens is not None:
         if not needs_padded_form:
@@ -326,24 +446,20 @@ def packed_context_parallel_forward(
             # VLM and BSHD-only models expect [B, S] padded input. Reconstruct
             # padded 2D tensors from packed 1D via boolean masking — avoids
             # per-sample Python loop and GPU-CPU sync.
-            batch_size = cu_seqlens.shape[0] - 1
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = int(seq_lens.max().item())
             # int64 for input_ids: mbridge's get_rope_index uses input_ids.dtype
             # for position_ids, and some kernels (_index_put_impl_) require int64.
             # Upcast to torch.long so the scatter `input_ids_2d[mask] = input_ids`
             # below has matching source/dest dtypes (data pipeline may emit int32).
             if input_ids.dtype != torch.long:
                 input_ids = input_ids.to(torch.long)
-            attention_mask = (
-                torch.arange(max_seqlen, device=input_ids.device)[None, :]
-                < seq_lens[:, None]
+            input_ids, attention_mask, seq_lens, max_seqlen = packed_to_padded_bshd(
+                input_ids, cu_seqlens
             )
-            input_ids_2d = torch.zeros(
-                batch_size, max_seqlen, dtype=torch.long, device=input_ids.device
-            )
-            input_ids_2d[attention_mask] = input_ids
-            input_ids = input_ids_2d
+            if use_padded_seq and not is_vision:
+                # Megatron/MindSpeed's native BSHD CP path slices the sequence
+                # inside the model. Unlike packed THD, do not pre-split inputs
+                # here or the sequence dimension is sharded twice.
+                bshd_cp_flatten = mpu.get_context_parallel_world_size() > 1
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
     # VLM path: attention_mask=None — model's get_rope_index uses the 2D mask
@@ -413,11 +529,18 @@ def packed_context_parallel_forward(
     # so a boolean mask of valid positions selects the packed sequence.
     if padded_repack_info is not None and is_pipeline_last_stage:
         _, repack_seq_lens, repack_max_seqlen = padded_repack_info
-        mask = (
-            torch.arange(repack_max_seqlen, device=output.device)[None, :]
-            < repack_seq_lens[:, None]
-        )
-        output = output[mask]
+        if bshd_cp_flatten:
+            output = output.reshape(-1, *output.shape[2:]).unsqueeze(0)
+            if gather_cp_output:
+                return reassemble_cp_bshd_tensor(
+                    output.squeeze(0), repack_seq_lens, repack_max_seqlen
+                )
+        else:
+            mask = (
+                torch.arange(repack_max_seqlen, device=output.device)[None, :]
+                < repack_seq_lens[:, None]
+            )
+            output = output[mask]
     output = postprocess_packed_seqs_context_parallel(
         output, cu_seqlens, is_pipeline_last_stage, gather_output=gather_cp_output
     )

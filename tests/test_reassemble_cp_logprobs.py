@@ -449,3 +449,131 @@ class TestSplitReassembleConsistencyWithMegatron:
                 actual = split_packed_seqs_for_context_parallel(original, cu_seqlens)
 
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    def test_split_bshd_uses_zigzag_sequence_chunks(self):
+        tensor = torch.arange(2 * 16).reshape(2, 16)
+
+        with patch(
+            "areal.engine.megatron_utils.packed_context_parallel.mpu"
+        ) as mock_mpu:
+            mock_mpu.get_context_parallel_world_size.return_value = 4
+            mock_mpu.get_context_parallel_rank.return_value = 1
+
+            from areal.engine.megatron_utils.packed_context_parallel import (
+                split_bshd_for_context_parallel,
+            )
+
+            actual = split_bshd_for_context_parallel(tensor)
+
+        expected = torch.cat((tensor[:, 2:4], tensor[:, 12:14]), dim=1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_split_packed_to_bshd_flattens_local_chunks(self):
+        input_ids = torch.arange(24)
+        cu_seqlens = _make_cu_seqlens([8, 16])
+
+        with patch(
+            "areal.engine.megatron_utils.packed_context_parallel.mpu"
+        ) as mock_mpu:
+            mock_mpu.get_context_parallel_world_size.return_value = 2
+            mock_mpu.get_context_parallel_rank.return_value = 0
+
+            from areal.engine.megatron_utils.packed_context_parallel import (
+                split_packed_to_bshd_for_context_parallel,
+            )
+
+            actual = split_packed_to_bshd_for_context_parallel(input_ids, cu_seqlens)
+
+        expected_2d = torch.tensor(
+            [
+                [0, 1, 6, 7],
+                [8, 9, 22, 23],
+            ]
+        )
+        torch.testing.assert_close(actual, expected_2d.reshape(-1), rtol=0, atol=0)
+
+    def test_padded_forward_lets_model_slice_bshd_cp_output_local(self):
+        input_ids = torch.arange(16)
+        cu_seqlens = _make_cu_seqlens([8, 8])
+        seen: dict[str, torch.Tensor | None] = {}
+
+        class DummyModel(torch.nn.Module):
+            def forward(
+                self,
+                *,
+                input_ids,
+                attention_mask,
+                position_ids,
+                packed_seq_params,
+            ):
+                seen["input_ids"] = input_ids
+                seen["attention_mask"] = attention_mask
+                seen["position_ids"] = position_ids
+                seen["packed_seq_params"] = packed_seq_params
+                from areal.engine.megatron_utils.packed_context_parallel import (
+                    split_bshd_for_context_parallel,
+                )
+
+                return split_bshd_for_context_parallel(input_ids).unsqueeze(-1).float()
+
+        with patch(
+            "areal.engine.megatron_utils.packed_context_parallel.mpu"
+        ) as mock_mpu:
+            mock_mpu.get_context_parallel_world_size.return_value = 2
+            mock_mpu.get_context_parallel_rank.return_value = 1
+            mock_mpu.is_pipeline_last_stage.return_value = True
+
+            from areal.engine.megatron_utils.packed_context_parallel import (
+                packed_context_parallel_forward,
+            )
+
+            output = packed_context_parallel_forward(
+                DummyModel(),
+                {"input_ids": input_ids, "cu_seqlens": cu_seqlens},
+                gather_cp_output=False,
+                use_padded_seq=True,
+            )
+
+        expected_full_ids = torch.tensor(
+            [
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                [8, 9, 10, 11, 12, 13, 14, 15],
+            ]
+        )
+        expected_local_ids = torch.tensor([[2, 3, 4, 5], [10, 11, 12, 13]])
+        torch.testing.assert_close(seen["input_ids"], expected_full_ids, rtol=0, atol=0)
+        torch.testing.assert_close(output, expected_local_ids.reshape(-1, 1).float())
+        assert seen["attention_mask"].shape == expected_full_ids.shape
+        assert seen["position_ids"] is None
+        assert seen["packed_seq_params"] is None
+
+    def test_reassemble_cp_bshd_tensor_restores_packed_valid_order(self):
+        full = torch.arange(2 * 8).reshape(2, 8)
+        seq_lens = torch.tensor([6, 8])
+        local_chunks = [
+            torch.cat((full[:, 0:2], full[:, 6:8]), dim=1).reshape(-1),
+            torch.cat((full[:, 2:4], full[:, 4:6]), dim=1).reshape(-1),
+        ]
+
+        with (
+            patch(
+                "areal.engine.megatron_utils.packed_context_parallel.mpu"
+            ) as mock_mpu,
+            patch(
+                "areal.engine.megatron_utils.packed_context_parallel.dist_F"
+            ) as mock_dist_F,
+        ):
+            mock_mpu.get_context_parallel_world_size.return_value = 2
+            mock_mpu.get_context_parallel_group.return_value = MagicMock()
+            mock_dist_F.all_gather.return_value = [
+                chunk.reshape(2, 4) for chunk in local_chunks
+            ]
+
+            from areal.engine.megatron_utils.packed_context_parallel import (
+                reassemble_cp_bshd_tensor,
+            )
+
+            actual = reassemble_cp_bshd_tensor(local_chunks[0], seq_lens, 8)
+
+        expected = torch.cat((full[0, :6], full[1, :8]), dim=0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
