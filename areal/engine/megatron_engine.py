@@ -1047,22 +1047,6 @@ class MegatronEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        self._forward_backward_batch(
-            mb_list,
-            process_output_fn,
-            forward_only=forward_only,
-            gather_cp_output=False,
-        )
-
-    def _forward_backward_batch(
-        self,
-        mb_list: MicroBatchList,
-        process_output_fn: Callable[
-            [torch.Tensor, dict[str, Any]], torch.Tensor | None
-        ],
-        forward_only: bool = False,
-        gather_cp_output: bool = False,
-    ) -> None:
         self._ensure_ready()
 
         def forward_step(batch_iter, model):
@@ -1093,12 +1077,12 @@ class MegatronEngine(TrainEngine):
                     tree_attn_keys = list(tree_kwargs.keys())
 
             cp_size = mpu.get_context_parallel_world_size()
-            cp_local = cp_size > 1 and not gather_cp_output
+            cp_local = cp_size > 1
 
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
-                gather_cp_output=gather_cp_output,
+                gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
             )
@@ -1314,12 +1298,7 @@ class MegatronEngine(TrainEngine):
             outputs.append(result)
             return None
 
-        self._forward_backward_batch(
-            mb_list,
-            process_output,
-            forward_only=True,
-            gather_cp_output=True,
-        )
+        self.forward_backward_batch(mb_list, process_output, forward_only=True)
 
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
@@ -2722,7 +2701,12 @@ class MegatronEngine(TrainEngine):
                     else None,
                 )
                 return logprobs
-            labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            cp_local_labels = inputs.get("_cp_local_labels")
+            cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
+            if cp_local_labels is not None:
+                labels = cp_local_labels
+            else:
+                labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
             logprobs = gather_logprobs(
                 output,
                 labels,
@@ -2731,6 +2715,23 @@ class MegatronEngine(TrainEngine):
                 if mpu.get_tensor_model_parallel_world_size() > 1
                 else None,
             )
+            if cp_padded_cu_seqlens is not None:
+                if inputs.get("_cp_layout") == "bshd":
+                    logprobs = reassemble_cp_bshd_tensor(
+                        logprobs,
+                        inputs["_cp_seq_lens"],
+                        inputs["_cp_max_seqlen"],
+                    )
+                else:
+                    logprobs = reassemble_cp_packed_logprobs(
+                        logprobs, cp_padded_cu_seqlens
+                    )
+                logprobs = unpad_logits(
+                    logprobs,
+                    inputs.get("_cp_padding_length", 0),
+                    cp_padded_cu_seqlens,
+                    inputs.get("_cp_old_cu_seqlens"),
+                )
             return logprobs
         else:
             values = output.squeeze(-1)
