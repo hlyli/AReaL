@@ -168,6 +168,7 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.lock import DistributedLock
+from areal.utils.math import align
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -2492,10 +2493,35 @@ class MegatronEngine(TrainEngine):
             n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs),
             n_mbs_divisor=pp_size,
         )
+        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+        align_to_multiple_of = (
+            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
+            if self.enable_fp8
+            else align_to_multiple_of
+        )
+        allocation_lens = None
+        if self.use_padded_seq:
+            attention_mask = input_["attention_mask"]
+            granularity = mb_spec.granularity
+            bs = attention_mask.shape[0]
+            if bs % granularity != 0:
+                raise RuntimeError(
+                    f"Batch size {bs} cannot divide granularity {granularity}."
+                )
+            seq_lens = attention_mask.sum(dim=1).long()
+            grouped_seq_lens = seq_lens.view(bs // granularity, granularity)
+            # BSHD logits scale with rectangular [B, S] tokens, not packed
+            # valid tokens. Use the later per-sequence alignment here so
+            # max_tokens_per_mb bounds the actual last-stage logits.
+            allocation_lens = [
+                int(align(int(group.max().item()), align_to_multiple_of) * granularity)
+                for group in grouped_seq_lens
+            ]
         mb_list = split_padded_tensor_dict_into_mb_list(
             input_,
             mb_spec,
             group=mpu.get_data_parallel_group(),
+            allocation_lens=allocation_lens,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         # NOTE: Pad micro-batches to:
@@ -2503,12 +2529,6 @@ class MegatronEngine(TrainEngine):
         #  of GPU page size or max_tokens_per_mb
         # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
         #    to satisfy the requirement of Megatron parallelism.
-        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-        align_to_multiple_of = (
-            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
-            if self.enable_fp8
-            else align_to_multiple_of
-        )
         mb_list = pad_mb_list(
             mb_list,
             pad_value=0.0,

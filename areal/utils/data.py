@@ -706,6 +706,7 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    allocation_lens: list[int] | None = None,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -738,6 +739,13 @@ def split_padded_tensor_dict_into_mb_list(
         .cpu()
         .numpy()
     )
+    if allocation_lens is not None:
+        if len(allocation_lens) != bs // granularity:
+            raise ValueError(
+                f"allocation_lens length {len(allocation_lens)} must match "
+                f"number of granularity groups {bs // granularity}."
+            )
+        input_lens = allocation_lens
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
