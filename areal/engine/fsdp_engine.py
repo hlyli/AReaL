@@ -1976,6 +1976,7 @@ class FSDPEngine(TrainEngine):
         if self.parallel_helper.sp_size > 1:
             input_ids = mb_item.padded_mb["input_ids"]
             position_ids = mb_item.padded_mb.get("position_ids", None)
+            slice_model_inputs = True
 
             if self.is_vision_model:
                 (
@@ -1985,6 +1986,19 @@ class FSDPEngine(TrainEngine):
                 ) = ulysses_pad(
                     input_ids, position_ids, sp_size=self.parallel_helper.sp_size
                 )
+            elif is_qwen3_5_model(self.model_config.model_type):
+                # Follow verl's Qwen3.5 contract: keep full input_ids/position_ids
+                # through the outer model and slice inputs_embeds in TextModel.forward.
+                (
+                    ulysses_input_ids,
+                    ulysses_position_ids,
+                    ulysses_pad_size,
+                ) = ulysses_pad(
+                    input_ids,
+                    position_ids,
+                    sp_size=self.parallel_helper.sp_size,
+                )
+                slice_model_inputs = False
             else:
                 # Pad and slice the inputs
                 (
@@ -2007,6 +2021,7 @@ class FSDPEngine(TrainEngine):
                 ulysses_input_ids,
                 ulysses_position_ids,
                 self.parallel_helper.sp_size,
+                slice_model_inputs=slice_model_inputs,
             )
         else:
             inputs = mb_item.padded_mb

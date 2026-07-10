@@ -10,9 +10,16 @@ import importlib
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 from torch import nn
 
+from areal.models.fsdp.ulysses import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_rank,
+    get_ulysses_sequence_parallel_world_size,
+)
 from areal.utils import logging
 
 logger = logging.getLogger("FLAPatchNPU")
@@ -118,6 +125,288 @@ def _patch_transformers_flash_linear_attention_available() -> None:
         )
 
 
+def _cache_has_previous_state(cache_params: Any) -> bool:
+    has_previous_state = getattr(cache_params, "has_previous_state", False)
+    return bool(
+        has_previous_state() if callable(has_previous_state) else has_previous_state
+    )
+
+
+def _update_cache_state(
+    cache_params: Any, layer_idx: int, state_name: str, value: Any
+) -> None:
+    update_name = (
+        f"update_{state_name[:-1] if state_name.endswith('s') else state_name}"
+    )
+    update_fn = getattr(cache_params, update_name, None)
+    if callable(update_fn):
+        update_fn(layer_idx, value)
+        return
+    getattr(cache_params, state_name)[layer_idx] = value
+
+
+def _get_gdn_cu_seqlens(
+    kwargs: dict[str, Any], device: torch.device
+) -> torch.Tensor | None:
+    cu_seqlens = kwargs.get("gdn_cu_seqlens")
+    if cu_seqlens is None:
+        cu_seqlens = kwargs.get("cu_seqlens")
+    if cu_seqlens is None:
+        cu_seqlens = kwargs.get("cu_seq_lens_q")
+    if cu_seqlens is None:
+        return None
+    return cu_seqlens.reshape(-1).to(device=device, dtype=torch.int64)
+
+
+def _get_local_gdn_conv1d_param(
+    param: torch.Tensor | None,
+    key_dim: int,
+    value_dim: int,
+    local_key_dim: int,
+    local_value_dim: int,
+    ulysses_rank: int,
+) -> torch.Tensor | None:
+    if param is None:
+        return None
+    k_off = ulysses_rank * local_key_dim
+    v_off = ulysses_rank * local_value_dim
+    q_param = param[k_off : k_off + local_key_dim]
+    k_param = param[key_dim + k_off : key_dim + local_key_dim + k_off]
+    v_param = param[2 * key_dim + v_off : 2 * key_dim + local_value_dim + v_off]
+    return torch.cat([q_param, k_param, v_param], dim=0)
+
+
+def qwen3_5_gated_deltanet_forward(
+    self,
+    hidden_states: torch.Tensor,
+    cache_params: Any | None = None,
+    cache_position: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    module = importlib.import_module(self.__class__.__module__)
+    apply_mask = getattr(module, "apply_mask_to_padding_states", None)
+    if apply_mask is not None:
+        hidden_states = apply_mask(hidden_states, attention_mask)
+    elif attention_mask is not None and attention_mask.shape[1] > 1:
+        hidden_states = hidden_states * attention_mask[:, :, None].to(
+            hidden_states.dtype
+        )
+
+    batch_size, local_seq_len, _ = hidden_states.shape
+    use_precomputed_states = (
+        cache_params is not None
+        and _cache_has_previous_state(cache_params)
+        and local_seq_len == 1
+        and cache_position is not None
+    )
+
+    if cache_params is not None:
+        conv_state = cache_params.conv_states[self.layer_idx]
+        recurrent_state = cache_params.recurrent_states[self.layer_idx]
+
+    mixed_qkv = self.in_proj_qkv(hidden_states)
+    z = self.in_proj_z(hidden_states).reshape(
+        batch_size, local_seq_len, -1, self.head_v_dim
+    )
+    b = self.in_proj_b(hidden_states)
+    a = self.in_proj_a(hidden_states)
+
+    ulysses_size = get_ulysses_sequence_parallel_world_size()
+    use_ulysses = ulysses_size > 1
+    if use_ulysses:
+        ulysses_rank = get_ulysses_sequence_parallel_rank()
+        if self.num_k_heads % ulysses_size != 0 or self.num_v_heads % ulysses_size != 0:
+            raise ValueError(
+                f"Ulysses SP size ({ulysses_size}) must divide num_k_heads "
+                f"({self.num_k_heads}) and num_v_heads ({self.num_v_heads}) "
+                "for Qwen3.5 GatedDeltaNet."
+            )
+        local_num_k_heads = self.num_k_heads // ulysses_size
+        local_num_v_heads = self.num_v_heads // ulysses_size
+        local_key_dim = self.head_k_dim * local_num_k_heads
+        local_value_dim = self.head_v_dim * local_num_v_heads
+
+        q_proj, k_proj, v_proj = torch.split(
+            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        q_proj = q_proj.reshape(
+            batch_size, local_seq_len, self.num_k_heads, self.head_k_dim
+        )
+        k_proj = k_proj.reshape(
+            batch_size, local_seq_len, self.num_k_heads, self.head_k_dim
+        )
+        v_proj = v_proj.reshape(
+            batch_size, local_seq_len, self.num_v_heads, self.head_v_dim
+        )
+        q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2)
+        k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2)
+        v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2)
+
+        b = b.reshape(batch_size, local_seq_len, self.num_v_heads)
+        a = a.reshape(batch_size, local_seq_len, self.num_v_heads)
+        b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2)
+        a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2)
+
+        mixed_qkv = torch.cat(
+            [
+                q_proj.reshape(batch_size, q_proj.shape[1], local_key_dim),
+                k_proj.reshape(batch_size, k_proj.shape[1], local_key_dim),
+                v_proj.reshape(batch_size, v_proj.shape[1], local_value_dim),
+            ],
+            dim=-1,
+        )
+    else:
+        ulysses_rank = 0
+        local_num_k_heads = self.num_k_heads
+        local_num_v_heads = self.num_v_heads
+        local_key_dim = self.key_dim
+        local_value_dim = self.value_dim
+
+    gdn_seq_len = mixed_qkv.shape[1]
+    cu_seqlens = _get_gdn_cu_seqlens(kwargs, hidden_states.device)
+
+    if use_precomputed_states:
+        mixed_qkv = self.causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            self.conv1d.weight.squeeze(1),
+            self.conv1d.bias,
+            self.activation,
+        )
+    else:
+        conv_weight = self.conv1d.weight
+        conv_bias = self.conv1d.bias
+        if use_ulysses:
+            conv_weight = _get_local_gdn_conv1d_param(
+                conv_weight,
+                self.key_dim,
+                self.value_dim,
+                local_key_dim,
+                local_value_dim,
+                ulysses_rank,
+            )
+            conv_bias = _get_local_gdn_conv1d_param(
+                conv_bias,
+                self.key_dim,
+                self.value_dim,
+                local_key_dim,
+                local_value_dim,
+                ulysses_rank,
+            )
+
+        if cache_params is not None:
+            conv_state = F.pad(
+                mixed_qkv.transpose(1, 2),
+                (self.conv_kernel_size - mixed_qkv.shape[1], 0),
+            )
+            _update_cache_state(cache_params, self.layer_idx, "conv_states", conv_state)
+
+        conv_weight_2d = conv_weight.squeeze(1)
+        causal_conv = getattr(self, "causal_conv1d_fn", None)
+        if causal_conv is not None:
+            try:
+                mixed_qkv, _ = causal_conv(
+                    x=mixed_qkv,
+                    weight=conv_weight_2d,
+                    bias=conv_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens,
+                )
+            except TypeError:
+                mixed_qkv = causal_conv(
+                    x=mixed_qkv,
+                    weight=conv_weight_2d,
+                    bias=conv_bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                ).transpose(1, 2)
+        else:
+            mixed_qkv_t = mixed_qkv.transpose(1, 2)
+            mixed_qkv = F.conv1d(
+                mixed_qkv_t,
+                weight=conv_weight,
+                bias=conv_bias,
+                padding=self.conv_kernel_size - 1,
+                groups=local_key_dim * 2 + local_value_dim,
+            )[:, :, :gdn_seq_len]
+            mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
+
+    query, key, value = torch.split(
+        mixed_qkv, [local_key_dim, local_key_dim, local_value_dim], dim=-1
+    )
+    query = query.reshape(batch_size, gdn_seq_len, local_num_k_heads, self.head_k_dim)
+    key = key.reshape(batch_size, gdn_seq_len, local_num_k_heads, self.head_k_dim)
+    value = value.reshape(batch_size, gdn_seq_len, local_num_v_heads, self.head_v_dim)
+
+    beta = b.sigmoid()
+    if use_ulysses:
+        v_head_offset = ulysses_rank * local_num_v_heads
+        v_head_slice = slice(v_head_offset, v_head_offset + local_num_v_heads)
+        g = -self.A_log[v_head_slice].float().exp() * F.softplus(
+            a.float() + self.dt_bias[v_head_slice]
+        )
+    else:
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+    if self.num_v_heads // self.num_k_heads > 1:
+        repeats = self.num_v_heads // self.num_k_heads
+        query = query.repeat_interleave(repeats, dim=2)
+        key = key.repeat_interleave(repeats, dim=2)
+
+    if not use_precomputed_states:
+        try:
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
+        except TypeError:
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+            )
+    else:
+        core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    if cache_params is not None:
+        _update_cache_state(
+            cache_params, self.layer_idx, "recurrent_states", last_recurrent_state
+        )
+
+    if use_ulysses:
+        core_attn_out = gather_heads_scatter_seq(core_attn_out, head_dim=2, seq_dim=1)
+
+    core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+    z = z.reshape(-1, self.head_v_dim)
+    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(batch_size, local_seq_len, -1)
+    return self.out_proj(core_attn_out)
+
+
 def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
     try:
         # patch L2 norm before importing GDN
@@ -144,6 +433,10 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
         # so keep the native Qwen3.5 torch implementation on NPU.
         setattr(module, "FusedRMSNormGated", None)
         setattr(module, "chunk_gated_delta_rule", chunk_gated_delta_rule)
+        if hasattr(module, "Qwen3_5GatedDeltaNet"):
+            module.Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_deltanet_forward
+        if hasattr(module, "Qwen3_5MoeGatedDeltaNet"):
+            module.Qwen3_5MoeGatedDeltaNet.forward = qwen3_5_gated_deltanet_forward
         patched_modules.append(module_name)
 
     if patched_modules:

@@ -251,12 +251,14 @@ def ulysses_prepare_inputs(
     ulysses_input_ids,
     ulysses_position_ids,
     sp_world_size,
+    slice_model_inputs: bool = True,
 ):
     # init inputs with padded_mb_input and ulysses_inputs
     inputs = padded_mb_input.copy()
-    inputs["input_ids"] = ulysses_input_ids
-    if ulysses_position_ids is not None:
-        inputs["position_ids"] = ulysses_position_ids
+    if slice_model_inputs:
+        inputs["input_ids"] = ulysses_input_ids
+        if ulysses_position_ids is not None:
+            inputs["position_ids"] = ulysses_position_ids
 
     # Pad and slice the loss inputs
     padded_input_ids = padded_mb_input["input_ids"]

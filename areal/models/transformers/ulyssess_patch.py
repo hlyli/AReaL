@@ -75,6 +75,7 @@ def patch_vlm_for_ulysses_input_slicing(model_class: type):
     def _create_ulysses_wrapped_decoder_forward(original_forward):
         def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
             inputs_embeds = kwargs.get("inputs_embeds")
+            position_ids = kwargs.get("position_ids")
             visual_pos_masks = kwargs.get("visual_pos_masks")
             deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
             call_kwargs = kwargs.copy()
@@ -90,6 +91,10 @@ def patch_vlm_for_ulysses_input_slicing(model_class: type):
                 call_kwargs["inputs_embeds"] = slice_input_tensor(
                     inputs_embeds, dim=1, padding=False
                 )
+                if position_ids is not None:
+                    call_kwargs["position_ids"] = slice_input_tensor(
+                        position_ids, dim=-1, padding=False
+                    )
                 # Slice visual_pos_masks and deepstack_visual_embeds for Qwen3-VL models (adapted from verl)
                 if visual_pos_masks is not None:
                     original_visual_mask = visual_pos_masks
@@ -144,6 +149,89 @@ def patch_vlm_for_ulysses_input_slicing(model_class: type):
     wrapped_forward = _create_ulysses_wrapped_decoder_forward(original_forward)
     model_class.forward = wrapped_forward
     logger.info(f"Patched {model_class.__name__}.forward")
+
+
+def _qwen3_5_base_forward(
+    self,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    pixel_values: torch.Tensor | None = None,
+    pixel_values_videos: torch.Tensor | None = None,
+    image_grid_thw: torch.Tensor | None = None,
+    video_grid_thw: torch.Tensor | None = None,
+    **kwargs,
+):
+    inputs_embeds = self.get_input_embeddings()(input_ids)
+
+    if pixel_values is not None:
+        pixel_values = pixel_values.type(self.visual.dtype)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+        image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
+        image_mask = image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+        inputs_embeds = inputs_embeds.masked_scatter(
+            image_mask, image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        )
+
+    if pixel_values_videos is not None:
+        pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+        video_embeds = self.visual(
+            pixel_values_videos, grid_thw=video_grid_thw
+        ).pooler_output
+        video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1)
+        video_mask = video_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+        inputs_embeds = inputs_embeds.masked_scatter(
+            video_mask, video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        )
+
+    kwargs["inputs_embeds"] = inputs_embeds
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask.to(inputs_embeds.device)
+    return self.language_model(input_ids=None, **kwargs)
+
+
+def patch_qwen3_5_for_ulysses_input_slicing(model_type: str):
+    qwen3_5_mappings = {
+        "qwen3_5": {
+            "module": "transformers.models.qwen3_5.modeling_qwen3_5",
+            "model_class": "Qwen3_5Model",
+            "text_model_class": "Qwen3_5TextModel",
+        },
+        "qwen3_5_text": {
+            "module": "transformers.models.qwen3_5.modeling_qwen3_5",
+            "model_class": "Qwen3_5Model",
+            "text_model_class": "Qwen3_5TextModel",
+        },
+        "qwen3_5_moe": {
+            "module": "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "model_class": "Qwen3_5MoeModel",
+            "text_model_class": "Qwen3_5MoeTextModel",
+        },
+        "qwen3_5_moe_text": {
+            "module": "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "model_class": "Qwen3_5MoeModel",
+            "text_model_class": "Qwen3_5MoeTextModel",
+        },
+    }
+    mapping = qwen3_5_mappings.get(model_type)
+    if mapping is None:
+        return
+
+    try:
+        module = __import__(
+            mapping["module"],
+            fromlist=[mapping["model_class"], mapping["text_model_class"]],
+        )
+    except ImportError as exc:
+        logger.warning("Failed to patch %s for Ulysses SP: %s", model_type, exc)
+        return
+
+    model_class = getattr(module, mapping["model_class"], None)
+    text_model_class = getattr(module, mapping["text_model_class"], None)
+    if model_class is not None:
+        model_class.forward = _qwen3_5_base_forward
+        logger.info(f"Patched {mapping['model_class']}.forward")
+    if text_model_class is not None:
+        patch_vlm_for_ulysses_input_slicing(text_model_class)
 
 
 def apply_monkey_patch(
@@ -203,7 +291,20 @@ def apply_monkey_patch(
     if ulysses_sp_size <= 1:
         return
 
-    if model.config.model_type in vl_model_mappings:
+    if model.config.model_type in {
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }:
+        patch_qwen3_5_for_ulysses_input_slicing(model.config.model_type)
+        from transformers.integrations import flash_attention
+
+        flash_attention._flash_attention_forward = _ulysses_flash_attention_forward
+        logger.info(
+            "Patched transformers.integrations.flash_attention._flash_attention_forward"
+        )
+    elif model.config.model_type in vl_model_mappings:
         # NOTE: The following code segment will patch only TextModel's attention and forward methods
         mapping = vl_model_mappings[model.config.model_type]
         module_name = mapping["module"]
